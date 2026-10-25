@@ -338,6 +338,7 @@ final class WriteMonitor: ObservableObject {
 // MARK: - 界面
 
 struct DashboardView: View {
+    var isPreview: Bool = false
     @EnvironmentObject var monitor: WriteMonitor
 
     var body: some View {
@@ -437,15 +438,26 @@ struct DashboardView: View {
                     .padding(.vertical, 8)
             } else {
                 let maxBytes = monitor.topProcesses.first?.bytes ?? 1
-                ScrollView(.vertical, showsIndicators: true) {
-                    LazyVStack(alignment: .leading, spacing: 9) {
-                        ForEach(monitor.topProcesses) { item in
+                if isPreview {
+                    // ImageRenderer 无法渲染 ScrollView 内容，截图时用静态列表
+                    VStack(alignment: .leading, spacing: 9) {
+                        ForEach(Array(monitor.topProcesses.prefix(7))) { item in
                             processRow(item, maxBytes: maxBytes)
                         }
                     }
-                    .padding(.trailing, 2)
+                    .frame(height: 173, alignment: .top)
+                    .clipped()
+                } else {
+                    ScrollView(.vertical, showsIndicators: true) {
+                        LazyVStack(alignment: .leading, spacing: 9) {
+                            ForEach(monitor.topProcesses) { item in
+                                processRow(item, maxBytes: maxBytes)
+                            }
+                        }
+                        .padding(.trailing, 2)
+                    }
+                    .frame(height: 173)
                 }
-                .frame(height: 173)
             }
         }
     }
@@ -727,7 +739,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func renderPreview(to path: String) {
         let monitor = WriteMonitor()
         monitor.seedPreview()
-        let view = DashboardView()
+        let view = DashboardView(isPreview: true)
             .environmentObject(monitor)
             .environment(\.colorScheme, .dark)
         let renderer = ImageRenderer(content: view)
