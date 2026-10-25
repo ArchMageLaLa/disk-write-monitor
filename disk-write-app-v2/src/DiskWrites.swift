@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Darwin
+import ServiceManagement
 
 // MARK: - 数据模型
 
@@ -33,6 +34,14 @@ enum Palette {
     static let ok = Color(red: 0.204, green: 0.827, blue: 0.600)
     static let warn = Color(red: 0.984, green: 0.749, blue: 0.141)
     static let bad = Color(red: 0.973, green: 0.443, blue: 0.443)
+    static let series: [Color] = [
+        Color(red: 0.220, green: 0.741, blue: 0.973),
+        Color(red: 0.353, green: 0.847, blue: 0.588),
+        Color(red: 0.984, green: 0.647, blue: 0.302),
+        Color(red: 0.788, green: 0.580, blue: 0.973),
+        Color(red: 0.973, green: 0.443, blue: 0.545),
+        Color(red: 0.941, green: 0.839, blue: 0.353)
+    ]
 }
 
 // MARK: - 采集器
@@ -51,6 +60,9 @@ final class WriteMonitor: ObservableObject {
     @Published var history: [WriteSample] = []
     @Published var isPaused = false
     @Published var topProcesses: [ProcWrite] = []
+    @Published var activeProcesses: Set<String> = []
+    @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var loginError: String?
 
     private var timer: Timer?
     private var busy = false
@@ -61,6 +73,10 @@ final class WriteMonitor: ObservableObject {
     private var procPreviousBytes: [pid_t: UInt64] = [:]
     private var procNames: [pid_t: String] = [:]
     private var procCumulative: [String: UInt64] = [:]
+    private var procRates: [String: [(Date, Double)]] = [:]
+    private var procLastActive: [String: Date] = [:]
+    private var lastProcSample: Date?
+    private let activityThreshold: Double = 256_000
 
     static let unitBytes = 512_000.0
 
@@ -95,6 +111,10 @@ final class WriteMonitor: ObservableObject {
     // MARK: 进程级写入
 
     private func applyProcesses(_ snapshot: [pid_t: UInt64], at now: Date) {
+        let dt = max(0.2, now.timeIntervalSince(lastProcSample ?? now.addingTimeInterval(-1)))
+        lastProcSample = now
+
+        var deltas: [String: UInt64] = [:]
         for (pid, written) in snapshot {
             var name = procNames[pid] ?? Self.processName(pid)
             if name.hasPrefix("pid ") { name = Self.processName(pid) }
@@ -111,6 +131,7 @@ final class WriteMonitor: ObservableObject {
                 let delta = written - previous
                 if delta > 0 {
                     procCumulative[name, default: 0] += delta
+                    deltas[name, default: 0] += delta
                 }
             }
             procPreviousBytes[pid] = written
@@ -127,8 +148,30 @@ final class WriteMonitor: ObservableObject {
             let keep = Set(procCumulative.sorted { $0.value > $1.value }.prefix(1000).map { $0.key })
             for name in Array(procCumulative.keys) where !keep.contains(name) {
                 procCumulative[name] = nil
+                procRates[name] = nil
+                procLastActive[name] = nil
             }
         }
+
+        // 每个进程保留最近 60 秒的速率，供叠加曲线使用
+        let cutoff = now.addingTimeInterval(-61)
+        for name in procCumulative.keys {
+            let rate = Double(deltas[name] ?? 0) / dt / 1_000_000.0
+            var points = procRates[name] ?? []
+            points.append((now, rate))
+            if points.count > 90 { points.removeFirst(points.count - 90) }
+            points.removeAll { $0.0 < cutoff }
+            procRates[name] = points
+        }
+
+        for (name, delta) in deltas where Double(delta) >= activityThreshold {
+            procLastActive[name] = now
+        }
+        activeProcesses = Set(
+            procLastActive.compactMap { name, last in
+                now.timeIntervalSince(last) < 2.5 ? name : nil
+            }
+        )
 
         topProcesses = procCumulative
             .compactMap { name, total -> ProcWrite? in
@@ -136,6 +179,27 @@ final class WriteMonitor: ObservableObject {
                 return ProcWrite(id: name, name: name, bytes: total)
             }
             .sorted { $0.bytes > $1.bytes }
+    }
+
+    func rateHistory(for name: String) -> [WriteSample] {
+        (procRates[name] ?? []).map { WriteSample(time: $0.0, rate: $0.1) }
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+            } else if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            loginError = nil
+        } catch {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            loginError = "设置失败：\(error.localizedDescription)"
+        }
     }
 
     nonisolated static func snapshotProcesses() -> [pid_t: UInt64] {
@@ -332,6 +396,21 @@ final class WriteMonitor: ObservableObject {
             points.append(WriteSample(time: now.addingTimeInterval(-Double(i)), rate: max(0, v)))
         }
         history = points
+
+        activeProcesses = ["Google Chrome", "Finder"]
+        for (index, name) in ["Google Chrome", "Finder", "backupd"].enumerated() {
+            var rates: [(Date, Double)] = []
+            for step in stride(from: 59, through: 0, by: -1) {
+                let t = 59 - step
+                var value = 0.3 + sin((Double(t) + Double(index) * 14) / 7) * 0.2
+                let start = 22 + index * 8
+                if t >= start && t <= start + 4 {
+                    value = 6 + Double(index) * 3 - Double(t - start)
+                }
+                rates.append((now.addingTimeInterval(-Double(step)), max(0, value)))
+            }
+            procRates[name] = rates
+        }
     }
 }
 
@@ -339,7 +418,17 @@ final class WriteMonitor: ObservableObject {
 
 struct DashboardView: View {
     var isPreview: Bool = false
+    var previewSelection: [String] = []
     @EnvironmentObject var monitor: WriteMonitor
+    @State private var selected: [String]
+
+    private let maxSelection = 6
+
+    init(isPreview: Bool = false, previewSelection: [String] = []) {
+        self.isPreview = isPreview
+        self.previewSelection = previewSelection
+        _selected = State(initialValue: previewSelection)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -375,9 +464,29 @@ struct DashboardView: View {
                     .padding(.vertical, 6)
             }
 
-            ChartView(samples: monitor.history)
-                .frame(height: 190)
-                .padding(.top, 4)
+            HStack(spacing: 8) {
+                Text(selected.isEmpty ? "整盘写入 · 60 秒" : "已选 \(selected.count) 个进程 · 60 秒")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Palette.text)
+                if selected.count >= maxSelection {
+                    Text("最多 \(maxSelection) 个")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(Palette.muted)
+                }
+                Spacer()
+                if !selected.isEmpty {
+                    Button("清除") { selected.removeAll() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundColor(Palette.muted)
+                }
+            }
+            .padding(.top, 2)
+            .padding(.bottom, 2)
+
+            ChartView(series: chartSeries)
+                .frame(height: 186)
+                .padding(.top, 2)
                 .padding(.bottom, 2)
 
             HStack {
@@ -402,6 +511,39 @@ struct DashboardView: View {
             processSection
                 .padding(.bottom, 12)
 
+            HStack(spacing: 10) {
+                Button {
+                    monitor.setLaunchAtLogin(!monitor.launchAtLogin)
+                } label: {
+                    HStack(spacing: 8) {
+                        Text("开机自启")
+                            .font(.system(size: 11.5))
+                            .foregroundColor(Palette.muted)
+                        ZStack(alignment: monitor.launchAtLogin ? .trailing : .leading) {
+                            Capsule()
+                                .fill(monitor.launchAtLogin
+                                      ? Palette.ok.opacity(0.85)
+                                      : Color.white.opacity(0.12))
+                                .frame(width: 30, height: 17)
+                            Circle()
+                                .fill(Color.white.opacity(0.92))
+                                .frame(width: 13, height: 13)
+                                .padding(2)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+
+                if let error = monitor.loginError {
+                    Text(error)
+                        .font(.system(size: 10.5))
+                        .foregroundColor(Palette.bad)
+                        .lineLimit(1)
+                }
+                Spacer()
+            }
+            .padding(.bottom, 10)
+
             HStack {
                 Text("数据来源：smartctl + proc_pid_rusage")
                 Spacer()
@@ -411,9 +553,35 @@ struct DashboardView: View {
             .foregroundColor(Palette.muted)
         }
         .padding(22)
-        .frame(width: 600, height: 772, alignment: .topLeading)
+        .frame(width: 600, height: 776, alignment: .topLeading)
         .background(Palette.background)
         .preferredColorScheme(.dark)
+    }
+
+    private var chartSeries: [ChartSeries] {
+        if selected.isEmpty {
+            return [ChartSeries(id: "disk", name: "整盘", color: Palette.accent, points: monitor.history)]
+        }
+        return selected.enumerated().map { index, name in
+            ChartSeries(
+                id: name,
+                name: name,
+                color: seriesColor(index),
+                points: monitor.rateHistory(for: name)
+            )
+        }
+    }
+
+    private func seriesColor(_ index: Int) -> Color {
+        Palette.series[index % Palette.series.count]
+    }
+
+    private func toggleSelection(_ name: String) {
+        if let index = selected.firstIndex(of: name) {
+            selected.remove(at: index)
+        } else if selected.count < maxSelection {
+            selected.append(name)
+        }
     }
 
     private var processSection: some View {
@@ -440,23 +608,23 @@ struct DashboardView: View {
                 let maxBytes = monitor.topProcesses.first?.bytes ?? 1
                 if isPreview {
                     // ImageRenderer 无法渲染 ScrollView 内容，截图时用静态列表
-                    VStack(alignment: .leading, spacing: 9) {
+                    VStack(alignment: .leading, spacing: 6) {
                         ForEach(Array(monitor.topProcesses.prefix(7))) { item in
                             processRow(item, maxBytes: maxBytes)
                         }
                     }
-                    .frame(height: 173, alignment: .top)
+                    .frame(height: 162, alignment: .top)
                     .clipped()
                 } else {
                     ScrollView(.vertical, showsIndicators: true) {
-                        LazyVStack(alignment: .leading, spacing: 9) {
+                        LazyVStack(alignment: .leading, spacing: 6) {
                             ForEach(monitor.topProcesses) { item in
                                 processRow(item, maxBytes: maxBytes)
                             }
                         }
                         .padding(.trailing, 2)
                     }
-                    .frame(height: 173)
+                    .frame(height: 162)
                 }
             }
         }
@@ -464,39 +632,68 @@ struct DashboardView: View {
 
     private func processRow(_ item: ProcWrite, maxBytes: UInt64) -> some View {
         let fraction = maxBytes == 0 ? 0 : Double(item.bytes) / Double(maxBytes)
-        return HStack(spacing: 10) {
-            Text(item.name)
-                .font(.system(size: 11.5))
-                .foregroundColor(Palette.text)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(width: 140, alignment: .leading)
+        let selectionIndex = selected.firstIndex(of: item.name)
+        let color = selectionIndex.map { seriesColor($0) } ?? Palette.accent
+        let isActive = monitor.activeProcesses.contains(item.name)
 
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.06))
-                    Capsule()
-                        .fill(Palette.accent.opacity(0.78))
-                        .frame(width: max(3, geo.size.width * CGFloat(fraction)))
+        return Button {
+            toggleSelection(item.name)
+        } label: {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(isActive ? Palette.ok : Color.white.opacity(0.12))
+                    .frame(width: 7, height: 7)
+
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(selectionIndex == nil ? Color.clear : color)
+                    .frame(width: 3, height: 13)
+
+                Text(item.name)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(Palette.text)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: 126, alignment: .leading)
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.06))
+                        Capsule()
+                            .fill(color.opacity(selectionIndex == nil ? 0.78 : 0.90))
+                            .frame(width: max(3, geo.size.width * CGFloat(fraction)))
+                    }
                 }
-            }
-            .frame(height: 6)
+                .frame(height: 6)
 
-            Text(formatBytes(item.bytes))
-                .font(.system(size: 11))
-                .monospacedDigit()
-                .foregroundColor(Palette.muted)
-                .frame(width: 72, alignment: .trailing)
+                Text(formatBytes(item.bytes))
+                    .font(.system(size: 11))
+                    .monospacedDigit()
+                    .foregroundColor(Palette.muted)
+                    .frame(width: 72, alignment: .trailing)
+            }
+            .padding(.horizontal, 4)
+            .frame(height: 18)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(selectionIndex == nil ? Color.clear : color.opacity(0.10))
+            )
+            .contentShape(Rectangle())
         }
-        .frame(height: 17)
+        .buttonStyle(.plain)
     }
 
     private func formatBytes(_ bytes: UInt64) -> String {
-        let gigabytes = Double(bytes) / 1e9
-        if gigabytes >= 1 {
-            return String(format: "%.1f GB", gigabytes)
+        let value = Double(bytes)
+        if value >= 1e9 {
+            return String(format: "%.1f GB", value / 1e9)
         }
-        return String(format: "%.0f MB", Double(bytes) / 1e6)
+        if value >= 1e7 {
+            return String(format: "%.0f MB", value / 1e6)
+        }
+        if value >= 1e6 {
+            return String(format: "%.1f MB", value / 1e6)
+        }
+        return String(format: "%.0f KB", value / 1e3)
     }
 
     private var header: some View {
@@ -569,8 +766,15 @@ struct DashboardView: View {
     }
 }
 
+struct ChartSeries: Identifiable {
+    let id: String
+    let name: String
+    let color: Color
+    let points: [WriteSample]
+}
+
 struct ChartView: View {
-    let samples: [WriteSample]
+    let series: [ChartSeries]
 
     var body: some View {
         Canvas { context, size in
@@ -582,9 +786,15 @@ struct ChartView: View {
             let window: TimeInterval = 60
             let start = now.addingTimeInterval(-window)
 
-            let visible = samples.filter { $0.time >= start.addingTimeInterval(-2) }
+            let cutoff = start.addingTimeInterval(-2)
+            let visibleSeries = series
+                .map { ($0, $0.points.filter { $0.time >= cutoff }) }
+                .filter { !$0.1.isEmpty }
+
             var maxRate: Double = 1
-            for s in visible { maxRate = max(maxRate, s.rate) }
+            for (_, points) in visibleSeries {
+                for p in points { maxRate = max(maxRate, p.rate) }
+            }
             let maxY = niceMax(maxRate * 1.15)
 
             // 网格与刻度
@@ -606,7 +816,7 @@ struct ChartView: View {
                 )
             }
 
-            guard visible.count >= 2 else {
+            guard visibleSeries.contains(where: { $0.1.count >= 2 }) else {
                 context.draw(
                     Text("收集中…").font(.system(size: 11)).foregroundColor(Palette.muted),
                     at: CGPoint(x: (left + right) / 2, y: (top + bottom) / 2)
@@ -623,39 +833,49 @@ struct ChartView: View {
                 return bottom - CGFloat(ratio) * (bottom - top)
             }
 
-            var area = Path()
-            area.move(to: CGPoint(x: xPos(visible[0].time), y: bottom))
-            for s in visible {
-                area.addLine(to: CGPoint(x: xPos(s.time), y: yPos(s.rate)))
-            }
-            area.addLine(to: CGPoint(x: xPos(visible[visible.count - 1].time), y: bottom))
-            area.closeSubpath()
-            context.fill(
-                area,
-                with: .linearGradient(
-                    Gradient(colors: [Palette.accent.opacity(0.30), Palette.accent.opacity(0.0)]),
-                    startPoint: CGPoint(x: 0, y: top),
-                    endPoint: CGPoint(x: 0, y: bottom)
-                )
-            )
-
-            var line = Path()
-            for (index, s) in visible.enumerated() {
-                let point = CGPoint(x: xPos(s.time), y: yPos(s.rate))
-                if index == 0 { line.move(to: point) } else { line.addLine(to: point) }
-            }
-            context.stroke(line, with: .color(Palette.accent), style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-
-            if let last = visible.last {
-                let point = CGPoint(x: xPos(last.time), y: yPos(last.rate))
+            // 只有一条曲线时填充面积，多条时只画线，避免互相遮挡
+            if visibleSeries.count == 1, let only = visibleSeries.first {
+                let points = only.1
+                var area = Path()
+                area.move(to: CGPoint(x: xPos(points[0].time), y: bottom))
+                for p in points {
+                    area.addLine(to: CGPoint(x: xPos(p.time), y: yPos(p.rate)))
+                }
+                area.addLine(to: CGPoint(x: xPos(points[points.count - 1].time), y: bottom))
+                area.closeSubpath()
                 context.fill(
-                    Path(ellipseIn: CGRect(x: point.x - 7, y: point.y - 7, width: 14, height: 14)),
-                    with: .color(Palette.accent.opacity(0.16))
+                    area,
+                    with: .linearGradient(
+                        Gradient(colors: [only.0.color.opacity(0.28), only.0.color.opacity(0.0)]),
+                        startPoint: CGPoint(x: 0, y: top),
+                        endPoint: CGPoint(x: 0, y: bottom)
+                    )
                 )
-                context.fill(
-                    Path(ellipseIn: CGRect(x: point.x - 3, y: point.y - 3, width: 6, height: 6)),
-                    with: .color(Palette.accent)
+            }
+
+            for (item, points) in visibleSeries {
+                var line = Path()
+                for (index, p) in points.enumerated() {
+                    let point = CGPoint(x: xPos(p.time), y: yPos(p.rate))
+                    if index == 0 { line.move(to: point) } else { line.addLine(to: point) }
+                }
+                context.stroke(
+                    line,
+                    with: .color(item.color),
+                    style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round)
                 )
+
+                if let last = points.last {
+                    let point = CGPoint(x: xPos(last.time), y: yPos(last.rate))
+                    context.fill(
+                        Path(ellipseIn: CGRect(x: point.x - 6, y: point.y - 6, width: 12, height: 12)),
+                        with: .color(item.color.opacity(0.18))
+                    )
+                    context.fill(
+                        Path(ellipseIn: CGRect(x: point.x - 2.5, y: point.y - 2.5, width: 5, height: 5)),
+                        with: .color(item.color)
+                    )
+                }
             }
         }
     }
@@ -727,19 +947,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exit(0)
         }
 
+        if let index = args.firstIndex(of: "--login"), index + 1 < args.count {
+            let monitor = WriteMonitor()
+            monitor.setLaunchAtLogin(args[index + 1] == "on")
+            print("login status: \(SMAppService.mainApp.status.rawValue) error=\(monitor.loginError ?? "none")")
+            exit(0)
+        }
+
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            sender.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
+        }
+        return true
     }
 
     @MainActor
     private func renderPreview(to path: String) {
         let monitor = WriteMonitor()
         monitor.seedPreview()
-        let view = DashboardView(isPreview: true)
+
+        writePreview(
+            DashboardView(isPreview: true),
+            monitor: monitor,
+            to: path
+        )
+        let selectedPath = path.replacingOccurrences(of: ".png", with: "-selected.png")
+        writePreview(
+            DashboardView(isPreview: true, previewSelection: ["Google Chrome", "Finder"]),
+            monitor: monitor,
+            to: selectedPath
+        )
+    }
+
+    @MainActor
+    private func writePreview<V: View>(_ content: V, monitor: WriteMonitor, to path: String) {
+        let view = content
             .environmentObject(monitor)
             .environment(\.colorScheme, .dark)
         let renderer = ImageRenderer(content: view)
