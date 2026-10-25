@@ -25,6 +25,95 @@ struct ProcWrite: Identifiable {
     let bytes: UInt64
 }
 
+// MARK: - 每天一次的更新检查
+
+@MainActor
+final class UpdateChecker: ObservableObject {
+    struct Release {
+        let version: String
+        let url: URL
+    }
+
+    @Published var available: Release?
+    @Published var dismissedVersion: String?
+
+    private let endpoint = URL(string: "https://api.github.com/repos/ArchMageLaLa/disk-write-monitor/releases/latest")!
+    private let lastCheckKey = "update.lastCheck"
+    private let dismissedKey = "update.dismissedVersion"
+    private var timer: Timer?
+
+    init(previewVersion: String? = nil) {
+        dismissedVersion = UserDefaults.standard.string(forKey: dismissedKey)
+        if let previewVersion,
+           let url = URL(string: "https://github.com/ArchMageLaLa/disk-write-monitor/releases") {
+            available = Release(version: previewVersion, url: url)
+        }
+    }
+
+    func start() {
+        let last = UserDefaults.standard.object(forKey: lastCheckKey) as? Date ?? .distantPast
+        if Date().timeIntervalSince(last) >= 24 * 3600 {
+            check()
+        }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.check() }
+        }
+    }
+
+    func check(completion: ((String?) -> Void)? = nil) {
+        var request = URLRequest(url: endpoint)
+        request.timeoutInterval = 15
+        request.setValue("DiskWriteMonitor/\(UpdateChecker.currentVersion)", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            guard let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = json["tag_name"] as? String,
+                  let urlString = json["html_url"] as? String,
+                  let url = URL(string: urlString) else {
+                DispatchQueue.main.async { completion?(nil) }
+                return
+            }
+
+            let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            Task { @MainActor in
+                self.record(version: version, url: url)
+                completion?(version)
+            }
+        }.resume()
+    }
+
+    func dismiss() {
+        guard let version = available?.version else { return }
+        dismissedVersion = version
+        UserDefaults.standard.set(version, forKey: dismissedKey)
+    }
+
+    private func record(version: String, url: URL) {
+        UserDefaults.standard.set(Date(), forKey: lastCheckKey)
+        if UpdateChecker.isNewer(version, than: UpdateChecker.currentVersion) {
+            available = Release(version: version, url: url)
+        }
+    }
+
+    static var currentVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+
+    nonisolated static func isNewer(_ candidate: String, than current: String) -> Bool {
+        let a = candidate.split(separator: ".").map { Int($0) ?? 0 }
+        let b = current.split(separator: ".").map { Int($0) ?? 0 }
+        for index in 0..<max(a.count, b.count) {
+            let left = index < a.count ? a[index] : 0
+            let right = index < b.count ? b[index] : 0
+            if left != right { return left > right }
+        }
+        return false
+    }
+}
+
 enum Palette {
     static let background = Color(red: 0.043, green: 0.051, blue: 0.063)
     static let surface = Color(red: 0.078, green: 0.102, blue: 0.125)
@@ -420,6 +509,7 @@ struct DashboardView: View {
     var isPreview: Bool = false
     var previewSelection: [String] = []
     @EnvironmentObject var monitor: WriteMonitor
+    @EnvironmentObject var updater: UpdateChecker
     @State private var selected: [String]
 
     private let maxSelection = 6
@@ -434,6 +524,11 @@ struct DashboardView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
                 .padding(.bottom, 22)
+
+            if let release = updater.available, updater.dismissedVersion != release.version {
+                updateBanner(release)
+                    .padding(.bottom, 12)
+            }
 
             Text("当前写入速度")
                 .font(.system(size: 13))
@@ -553,9 +648,46 @@ struct DashboardView: View {
             .foregroundColor(Palette.muted)
         }
         .padding(22)
-        .frame(width: 600, height: 776, alignment: .topLeading)
+        .frame(width: 600, height: showsUpdateBanner ? 822 : 776, alignment: .topLeading)
         .background(Palette.background)
         .preferredColorScheme(.dark)
+    }
+
+    private var showsUpdateBanner: Bool {
+        guard let release = updater.available else { return false }
+        return updater.dismissedVersion != release.version
+    }
+
+    private func updateBanner(_ release: UpdateChecker.Release) -> some View {
+        HStack(spacing: 10) {
+            Text("↑")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(Palette.accent)
+            Text("发现新版本 v\(release.version)")
+                .font(.system(size: 12))
+                .foregroundColor(Palette.text)
+            Button("查看") {
+                NSWorkspace.shared.open(release.url)
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundColor(Palette.accent)
+            Spacer()
+            Button {
+                updater.dismiss()
+            } label: {
+                Text("✕")
+                    .font(.system(size: 11))
+                    .foregroundColor(Palette.muted)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Palette.accent.opacity(0.12))
+        )
     }
 
     private var chartSeries: [ChartSeries] {
@@ -954,6 +1086,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exit(0)
         }
 
+        if args.contains("--check-update") {
+            let checker = UpdateChecker()
+            var finished = false
+            checker.check { tag in
+                let newer = tag.map { UpdateChecker.isNewer($0, than: UpdateChecker.currentVersion) } ?? false
+                print("current=\(UpdateChecker.currentVersion) latest=\(tag ?? "nil") newer=\(newer)")
+                finished = true
+            }
+            let deadline = Date().addingTimeInterval(20)
+            while !finished && Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            }
+            UserDefaults.standard.removeObject(forKey: "update.lastCheck")
+            exit(0)
+        }
+
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -985,12 +1133,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             monitor: monitor,
             to: selectedPath
         )
+        let updatePath = path.replacingOccurrences(of: ".png", with: "-update.png")
+        writePreview(
+            DashboardView(isPreview: true, previewSelection: ["Google Chrome", "Finder"]),
+            monitor: monitor,
+            checker: UpdateChecker(previewVersion: "2.5"),
+            to: updatePath
+        )
     }
 
     @MainActor
-    private func writePreview<V: View>(_ content: V, monitor: WriteMonitor, to path: String) {
+    private func writePreview<V: View>(
+        _ content: V,
+        monitor: WriteMonitor,
+        checker: UpdateChecker? = nil,
+        to path: String
+    ) {
+        let checker = checker ?? UpdateChecker()
         let view = content
             .environmentObject(monitor)
+            .environmentObject(checker)
             .environment(\.colorScheme, .dark)
         let renderer = ImageRenderer(content: view)
         renderer.scale = 2
@@ -1016,12 +1178,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct DiskWritesApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var monitor = WriteMonitor()
+    @StateObject private var updater = UpdateChecker()
 
     var body: some Scene {
         WindowGroup("磁盘写入量") {
             DashboardView()
                 .environmentObject(monitor)
-                .onAppear { monitor.start() }
+                .environmentObject(updater)
+                .onAppear {
+                    monitor.start()
+                    updater.start()
+                }
         }
         .windowResizability(.contentSize)
         .commands {
