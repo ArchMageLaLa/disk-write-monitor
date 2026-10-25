@@ -1,0 +1,10 @@
+本应用内置 smartctl（smartmontools 7.5）用于读取硬盘 SMART 数据。
+
+smartmontools 版权归 Bruce Allen、Christian Franke 及贡献者所有，
+按 GNU General Public License v2 发布。完整许可证文本见
+LICENSE-smartmontools.txt。
+
+源代码地址：https://www.smartmontools.org/
+发行包地址：https://sourceforge.net/projects/smartmontools/files/
+
+本应用的其余部分（界面与数据采集逻辑）供个人使用。

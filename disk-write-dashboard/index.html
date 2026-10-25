@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>磁盘写入量</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --surface: #141a20;
+    --line: rgba(255, 255, 255, 0.07);
+    --line-strong: rgba(255, 255, 255, 0.12);
+    --text: #e9edf2;
+    --muted: #8a94a6;
+    --accent: #38bdf8;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+                 "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body { padding: 28px 22px 44px; overflow-x: hidden; }
+
+  .app { max-width: 880px; margin: 0 auto; }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 34px;
+  }
+
+  .device { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .device .name {
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .device .node { font-size: 12px; color: var(--muted); }
+
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--muted);
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--ok);
+    box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.16);
+  }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.16); }
+  .dot.bad  { background: var(--bad);  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.16); }
+
+  .hero { margin-bottom: 26px; }
+  .hero .label {
+    font-size: 13px;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+    margin-bottom: 10px;
+  }
+  .hero .value {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+  .hero .num {
+    font-size: clamp(46px, 9vw, 76px);
+    font-weight: 500;
+    letter-spacing: -0.03em;
+    background: linear-gradient(180deg, #ffffff 20%, #9ad9f5 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .hero .unit { font-size: 17px; color: var(--muted); font-weight: 400; }
+
+  .chart-wrap { position: relative; margin-bottom: 6px; }
+  canvas { display: block; width: 100%; height: 250px; }
+
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    padding: 9px 12px;
+    border-radius: 9px;
+    background: #1b222a;
+    border: 1px solid var(--line-strong);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: nowrap;
+    opacity: 0;
+    transform: translate(-50%, -115%);
+    transition: opacity 0.12s ease;
+  }
+  .tooltip.show { opacity: 1; }
+  .tooltip b { font-weight: 500; font-variant-numeric: tabular-nums; }
+  .tooltip span { color: var(--muted); }
+
+  .axis-note {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--muted);
+    margin: 2px 0 26px;
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .stat {
+    background: var(--surface);
+    border-radius: 13px;
+    padding: 15px 16px 14px;
+    min-width: 0;
+  }
+  .stat .k {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 9px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .stat .v {
+    font-size: 21px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+  .stat .v small { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 3px; }
+
+  footer {
+    margin-top: 22px;
+    font-size: 11.5px;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .banner {
+    display: none;
+    margin-bottom: 20px;
+    padding: 11px 14px;
+    border-radius: 10px;
+    background: rgba(248, 113, 113, 0.1);
+    color: #fca5a5;
+    font-size: 13px;
+  }
+  .banner.show { display: block; }
+
+  .ghost {
+    appearance: none;
+    border: 1px solid var(--line-strong);
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12.5px;
+    padding: 7px 13px;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .ghost:hover { color: var(--text); border-color: rgba(255,255,255,0.22); }
+  .ghost:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .controls { display: flex; align-items: center; gap: 10px; }
+
+  @media (max-width: 620px) {
+    body { padding: 20px 16px 32px; }
+    header { flex-direction: column; align-items: stretch; gap: 14px; }
+    .controls { justify-content: space-between; }
+    .device .name { max-width: 100%; }
+    .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    canvas { height: 200px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="device">
+      <div class="name" id="model">正在读取硬盘…</div>
+      <div class="node" id="node">/dev/disk0</div>
+    </div>
+    <div class="controls">
+      <div class="status"><span class="dot" id="dot"></span><span id="statusText">连接中</span></div>
+      <button class="ghost" id="pause" type="button" aria-pressed="false">暂停</button>
+    </div>
+  </header>
+
+  <div class="banner" id="banner"></div>
+
+  <section class="hero">
+    <div class="label">当前写入速度</div>
+    <div class="value">
+      <span class="num" id="rate">0.0</span>
+      <span class="unit">MB / 秒</span>
+    </div>
+  </section>
+
+  <div class="chart-wrap">
+    <canvas id="chart" role="img" aria-label="最近 60 秒写入速度曲线"></canvas>
+    <div class="tooltip" id="tip" role="tooltip"></div>
+  </div>
+  <div class="axis-note"><span>60 秒前</span><span>现在</span></div>
+
+  <section class="stats">
+    <div class="stat">
+      <div class="k">本次会话写入</div>
+      <div class="v"><span id="session">0.00</span><small>GB</small></div>
+    </div>
+    <div class="stat">
+      <div class="k">累计写入</div>
+      <div class="v"><span id="total">0</span><small>GB</small></div>
+    </div>
+    <div class="stat">
+      <div class="k">本次峰值</div>
+      <div class="v"><span id="peak">0.0</span><small>MB/s</small></div>
+    </div>
+    <div class="stat">
+      <div class="k">硬盘温度</div>
+      <div class="v"><span id="temp">–</span><small>°C</small></div>
+    </div>
+  </section>
+
+  <footer>
+    <span>数据来源：smartctl · Data Units Written</span>
+    <span id="stamp">等待第一组数据…</span>
+  </footer>
+</div>
+
+<script>
+const WINDOW_MS = 60000;
+const canvas = document.getElementById('chart');
+const ctx = canvas.getContext('2d');
+const tip = document.getElementById('tip');
+
+let samples = [];
+let paused = false;
+let layout = null;
+let lastPayload = null;
+
+const el = (id) => document.getElementById(id);
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function niceMax(v) {
+  if (v <= 0.6) return 1;
+  const exp = Math.floor(Math.log10(v));
+  const base = Math.pow(10, exp);
+  for (const m of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) {
+    if (v <= m * base) return m * base;
+  }
+  return 10 * base;
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.round(rect.width * dpr));
+  canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+
+function draw() {
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  const padL = 52, padR = 14, padT = 14, padB = 22;
+  const pxL = padL, pxR = w - padR, pxT = padT, pxB = h - padB;
+
+  ctx.clearRect(0, 0, w, h);
+
+  const now = Date.now();
+  const t0 = now - WINDOW_MS;
+  const visible = samples.filter((p) => p[0] >= t0 - 2000);
+  let maxRate = 1;
+  for (const p of visible) maxRate = Math.max(maxRate, p[1]);
+  const yMax = niceMax(maxRate * 1.15);
+  layout = { pxL, pxR, pxT, pxB, t0, t1: now, yMax };
+
+  const line = cssVar('--line') || 'rgba(255,255,255,0.07)';
+  const muted = cssVar('--muted') || '#8a94a6';
+
+  ctx.font = '11px -apple-system, "PingFang SC", sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 1;
+
+  for (let i = 0; i <= 4; i++) {
+    const y = pxB - ((pxB - pxT) * i) / 4;
+    ctx.strokeStyle = line;
+    ctx.beginPath();
+    ctx.moveTo(pxL, Math.round(y) + 0.5);
+    ctx.lineTo(pxR, Math.round(y) + 0.5);
+    ctx.stroke();
+
+    const val = (yMax * i) / 4;
+    ctx.fillStyle = muted;
+    ctx.fillText(val >= 10 ? val.toFixed(0) : val.toFixed(1), pxL - 10, y);
+  }
+
+  if (visible.length < 2) {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = muted;
+    ctx.fillText('收集中…', (pxL + pxR) / 2, (pxT + pxB) / 2);
+    return;
+  }
+
+  const xOf = (t) => pxL + ((t - t0) / (now - t0)) * (pxR - pxL);
+  const yOf = (v) => pxB - (Math.min(v, yMax) / yMax) * (pxB - pxT);
+
+  const accent = cssVar('--accent') || '#38bdf8';
+  const grad = ctx.createLinearGradient(0, pxT, 0, pxB);
+  grad.addColorStop(0, 'rgba(56,189,248,0.30)');
+  grad.addColorStop(1, 'rgba(56,189,248,0)');
+
+  ctx.beginPath();
+  ctx.moveTo(xOf(visible[0][0]), pxB);
+  for (const p of visible) ctx.lineTo(xOf(p[0]), yOf(p[1]));
+  ctx.lineTo(xOf(visible[visible.length - 1][0]), pxB);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  ctx.beginPath();
+  visible.forEach((p, i) => {
+    const x = xOf(p[0]);
+    const y = yOf(p[1]);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  const last = visible[visible.length - 1];
+  const lx = xOf(last[0]);
+  const ly = yOf(last[1]);
+  ctx.beginPath();
+  ctx.arc(lx, ly, 3.5, 0, Math.PI * 2);
+  ctx.fillStyle = accent;
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(lx, ly, 8, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(56,189,248,0.15)';
+  ctx.fill();
+}
+
+function setStatus(kind, text) {
+  const dot = el('dot');
+  dot.className = 'dot' + (kind === 'ok' ? '' : ' ' + kind);
+  el('statusText').textContent = text;
+}
+
+function render(payload) {
+  lastPayload = payload;
+  el('model').textContent = payload.model || payload.device;
+  el('node').textContent = `${payload.device} · ${payload.interval.toFixed(0)} 秒采样`;
+
+  if (!payload.ok) {
+    setStatus('bad', '读取失败');
+    const banner = el('banner');
+    banner.textContent = `读不到硬盘数据：${payload.error || '未知错误'}`;
+    banner.classList.add('show');
+  } else {
+    el('banner').classList.remove('show');
+  }
+
+  el('rate').textContent = payload.rate < 0.05 ? '0.0' : payload.rate.toFixed(1);
+  el('session').textContent = payload.sessionGb.toFixed(2);
+  el('total').textContent = payload.totalGb >= 1000
+    ? (payload.totalGb / 1000).toFixed(2)
+    : payload.totalGb.toFixed(1);
+  el('total').nextElementSibling.textContent = payload.totalGb >= 1000 ? 'TB' : 'GB';
+  el('peak').textContent = payload.peak < 0.05 ? '0.0' : payload.peak.toFixed(1);
+  el('temp').textContent = payload.temp == null ? '–' : String(payload.temp);
+
+  const t = new Date(payload.updated || Date.now());
+  el('stamp').textContent = `更新于 ${t.toLocaleTimeString('zh-CN')}`;
+
+  if (payload.ok && !paused) {
+    setStatus('ok', '实时');
+  }
+
+  samples = payload.history || [];
+  draw();
+}
+
+async function tick() {
+  try {
+    const res = await fetch('/api/data', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await res.json();
+    if (!paused) render(payload);
+  } catch (err) {
+    setStatus('bad', '连接断开');
+    el('banner').textContent = `和小面板的本地服务断了：${err.message}`;
+    el('banner').classList.add('show');
+  } finally {
+    setTimeout(tick, 1000);
+  }
+}
+
+el('pause').addEventListener('click', () => {
+  paused = !paused;
+  const btn = el('pause');
+  btn.textContent = paused ? '继续' : '暂停';
+  btn.setAttribute('aria-pressed', String(paused));
+  if (paused) {
+    setStatus('warn', '已暂停');
+  } else {
+    setStatus('ok', '实时');
+    if (lastPayload) render(lastPayload);
+  }
+});
+
+canvas.addEventListener('mousemove', (ev) => {
+  if (!layout || samples.length < 2) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const { pxL, pxR, t0, t1 } = layout;
+  if (x < pxL || x > pxR) { tip.classList.remove('show'); return; }
+
+  const target = t0 + ((x - pxL) / (pxR - pxL)) * (t1 - t0);
+  let best = null;
+  for (const p of samples) {
+    if (p[0] > t1 || p[0] < t0) continue;
+    if (!best || Math.abs(p[0] - target) < Math.abs(best[0] - target)) best = p;
+  }
+  if (!best) return;
+
+  const rate = best[1] < 0.05 ? '0.0' : best[1].toFixed(1);
+  const time = new Date(best[0]).toLocaleTimeString('zh-CN');
+  tip.innerHTML = `<b>${rate} MB/s</b><br><span>${time}</span>`;
+  tip.style.left = `${x}px`;
+  tip.style.top = `${rect.height * 0.42}px`;
+  tip.classList.add('show');
+});
+
+canvas.addEventListener('mouseleave', () => tip.classList.remove('show'));
+window.addEventListener('resize', resize);
+
+resize();
+tick();
+</script>
+</body>
+</html>
