@@ -11,6 +11,7 @@ dist/
 # 临时文件
 work/
 *.log
+*.zip
 
 # Xcode / SwiftPM
 .build/
