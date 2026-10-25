@@ -17,6 +17,14 @@
 - 每天检查一次 GitHub 是否有新版本，发现后显示提示条
 - 只读监控，除版本检查外不联网，不上传任何数据
 
+## 平台与移植
+
+- **macOS**：本仓库，当前版本 v2.4
+- **Windows**：独立仓库（待建），按 [WINDOWS-PORT.md](WINDOWS-PORT.md) 的行为契约实现
+
+功能以 macOS 侧定义的行为为准；每次发版的「移植影响」记录在
+[CHANGELOG.md](CHANGELOG.md)，Windows 侧按版本区间同步。
+
 ## 下载
 
 前往 [Releases](../../releases) 下载最新的 `.dmg`，双击打开，
@@ -49,6 +57,8 @@ cd disk-write-app-v2
 | `disk-write-app/` | v1，仅整盘写入量 |
 | `disk-write-dashboard/` | 早期的本地网页面板 |
 | `smart-write-monitor.sh` | 最早的终端版脚本 |
+| `WINDOWS-PORT.md` | Windows 移植规格与验收清单 |
+| `CHANGELOG.md` | 版本变更与移植影响 |
 
 各目录内有更详细的 README，版本留档见 `disk-write-app-v2/archive/README.md`。
 
