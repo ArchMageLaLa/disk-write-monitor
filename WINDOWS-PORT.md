@@ -88,6 +88,23 @@ macOS 上偶发 `IOCreatePlugInInterfaceForService failed`，做法是 0.15 秒�
 
 按 `.` 分段转整数逐段比较（`2.10 > 2.9`），禁止字符串比较。
 
+### 3.7 写入日志（macOS v2.5 起，Windows 待评估）
+
+可选功能，默认关闭。开启后每 10 秒追加一行 JSONL：
+
+```json
+{"time":"2026-10-26 10:22:44","window_s":11,"diskMB":6.14,"gapMB":5.59,
+ "processes":[{"name":"ChatGPT","mb":0.32},{"name":"codex","mb":0.11}]}
+```
+
+- `diskMB`：本窗口盘级写入量（固件口径）
+- `processes`：窗口内写入量前 8 的进程
+- `gapMB`：盘级减去全部可读进程之和，表示未归属部分
+- 文件超过 20 MB 滚动为 `write-log.previous.jsonl`
+
+macOS 路径：`~/Library/Application Support/DiskWriteMonitor/write-log.jsonl`。
+Windows 若跟进，路径与格式需保持一致，便于跨平台分析。
+
 ## 4. 界面规格
 
 窗口内容自上而下：

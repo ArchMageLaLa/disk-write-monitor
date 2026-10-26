@@ -12,6 +12,11 @@ dist/
 work/
 *.log
 *.zip
+.tmpbuild/
+track-writes.py
+write-tracker.jsonl
+tracker.out
+cleanup-session.sh
 
 # Xcode / SwiftPM
 .build/

@@ -133,6 +133,70 @@ enum Palette {
     ]
 }
 
+// MARK: - 写入记录
+
+final class WriteRecorder {
+    private let directory: URL
+    private let fileURL: URL
+    private let maxBytes: UInt64 = 20 * 1024 * 1024
+    private let formatter: DateFormatter
+
+    init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        directory = base.appendingPathComponent("DiskWriteMonitor", isDirectory: true)
+        fileURL = directory.appendingPathComponent("write-log.jsonl")
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    }
+
+    var path: String { fileURL.path }
+
+    func append(diskMB: Double, window: Double, processes: [(String, Double)], gapMB: Double) {
+        rotateIfNeeded()
+
+        let payload: [String: Any] = [
+            "time": formatter.string(from: Date()),
+            "window_s": number(window),
+            "diskMB": number(diskMB),
+            "gapMB": number(gapMB),
+            "processes": processes.map { ["name": $0.0, "mb": number($0.1)] }
+        ]
+        guard JSONSerialization.isValidJSONObject(payload),
+              var data = try? JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes]) else {
+            return
+        }
+        data.append(0x0A)
+
+        if let handle = try? FileHandle(forWritingTo: fileURL) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: fileURL)
+        }
+    }
+
+    func openFolder() {
+        NSWorkspace.shared.open(directory)
+    }
+
+    private func number(_ value: Double) -> NSDecimalNumber {
+        NSDecimalNumber(string: String(format: "%.2f", value))
+    }
+
+    private func rotateIfNeeded() {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+        guard size > maxBytes else { return }
+
+        let backup = directory.appendingPathComponent("write-log.previous.jsonl")
+        try? FileManager.default.removeItem(at: backup)
+        try? FileManager.default.moveItem(at: fileURL, to: backup)
+    }
+}
+
 // MARK: - 采集器
 
 @MainActor
@@ -152,6 +216,9 @@ final class WriteMonitor: ObservableObject {
     @Published var activeProcesses: Set<String> = []
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var loginError: String?
+    @Published var recordingEnabled: Bool = UserDefaults.standard.bool(forKey: "recorder.enabled") {
+        didSet { UserDefaults.standard.set(recordingEnabled, forKey: "recorder.enabled") }
+    }
 
     private var timer: Timer?
     private var busy = false
@@ -166,6 +233,10 @@ final class WriteMonitor: ObservableObject {
     private var procLastActive: [String: Date] = [:]
     private var lastProcSample: Date?
     private let activityThreshold: Double = 256_000
+    private let recorder = WriteRecorder()
+    private var logProcessBytes: [String: UInt64] = [:]
+    private var logDiskBytes: UInt64 = 0
+    private var logWindowStart = Date()
 
     static let unitBytes = 512_000.0
 
@@ -221,6 +292,7 @@ final class WriteMonitor: ObservableObject {
                 if delta > 0 {
                     procCumulative[name, default: 0] += delta
                     deltas[name, default: 0] += delta
+                    logProcessBytes[name, default: 0] += delta
                 }
             }
             procPreviousBytes[pid] = written
@@ -268,6 +340,46 @@ final class WriteMonitor: ObservableObject {
                 return ProcWrite(id: name, name: name, bytes: total)
             }
             .sorted { $0.bytes > $1.bytes }
+
+        flushLogIfNeeded(now: now)
+    }
+
+    private func flushLogIfNeeded(now: Date) {
+        guard recordingEnabled else {
+            logProcessBytes.removeAll()
+            logDiskBytes = 0
+            logWindowStart = now
+            return
+        }
+
+        let elapsed = now.timeIntervalSince(logWindowStart)
+        guard elapsed >= 10 else { return }
+
+        let diskMB = Double(logDiskBytes) / 1e6
+        let allProcessMB = Double(logProcessBytes.values.reduce(UInt64(0), +)) / 1e6
+        let top = logProcessBytes
+            .sorted { $0.value > $1.value }
+            .prefix(8)
+            .map { ($0.key, Double($0.value) / 1e6) }
+
+        recorder.append(
+            diskMB: diskMB,
+            window: elapsed,
+            processes: Array(top),
+            gapMB: max(0, diskMB - allProcessMB)
+        )
+
+        logProcessBytes.removeAll()
+        logDiskBytes = 0
+        logWindowStart = now
+    }
+
+    func openLogFolder() {
+        recorder.openFolder()
+    }
+
+    var logFilePath: String {
+        recorder.path
     }
 
     func rateHistory(for name: String) -> [WriteSample] {
@@ -349,6 +461,7 @@ final class WriteMonitor: ObservableObject {
             if let prev = previousUnits, let prevTime = previousTime {
                 let delta = max(0, result.units - prev)
                 let dt = max(0.2, now.timeIntervalSince(prevTime))
+                logDiskBytes += UInt64(delta) * UInt64(Self.unitBytes)
                 rate = Double(delta) * Self.unitBytes / 1_000_000.0 / dt
                 peak = max(peak, rate)
                 history.append(WriteSample(time: now, rate: rate))
@@ -606,28 +719,23 @@ struct DashboardView: View {
             processSection
                 .padding(.bottom, 12)
 
-            HStack(spacing: 10) {
-                Button {
+            HStack(spacing: 14) {
+                settingToggle("开机自启", isOn: monitor.launchAtLogin) {
                     monitor.setLaunchAtLogin(!monitor.launchAtLogin)
-                } label: {
-                    HStack(spacing: 8) {
-                        Text("开机自启")
-                            .font(.system(size: 11.5))
-                            .foregroundColor(Palette.muted)
-                        ZStack(alignment: monitor.launchAtLogin ? .trailing : .leading) {
-                            Capsule()
-                                .fill(monitor.launchAtLogin
-                                      ? Palette.ok.opacity(0.85)
-                                      : Color.white.opacity(0.12))
-                                .frame(width: 30, height: 17)
-                            Circle()
-                                .fill(Color.white.opacity(0.92))
-                                .frame(width: 13, height: 13)
-                                .padding(2)
-                        }
-                    }
                 }
-                .buttonStyle(.plain)
+
+                settingToggle("记录写入日志", isOn: monitor.recordingEnabled) {
+                    monitor.recordingEnabled.toggle()
+                }
+
+                if monitor.recordingEnabled {
+                    Button("打开日志") {
+                        monitor.openLogFolder()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundColor(Palette.accent)
+                }
 
                 if let error = monitor.loginError {
                     Text(error)
@@ -656,6 +764,26 @@ struct DashboardView: View {
     private var showsUpdateBanner: Bool {
         guard let release = updater.available else { return false }
         return updater.dismissedVersion != release.version
+    }
+
+    private func settingToggle(_ title: String, isOn: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(Palette.muted)
+                ZStack(alignment: isOn ? .trailing : .leading) {
+                    Capsule()
+                        .fill(isOn ? Palette.ok.opacity(0.85) : Color.white.opacity(0.12))
+                        .frame(width: 30, height: 17)
+                    Circle()
+                        .fill(Color.white.opacity(0.92))
+                        .frame(width: 13, height: 13)
+                        .padding(2)
+                }
+            }
+        }
+        .buttonStyle(.plain)
     }
 
     private func updateBanner(_ release: UpdateChecker.Release) -> some View {
@@ -1099,6 +1227,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 RunLoop.current.run(until: Date().addingTimeInterval(0.1))
             }
             UserDefaults.standard.removeObject(forKey: "update.lastCheck")
+            exit(0)
+        }
+
+        if let index = args.firstIndex(of: "--logtest") {
+            let seconds = index + 1 < args.count ? (Double(args[index + 1]) ?? 15) : 15
+            let monitor = WriteMonitor()
+            monitor.recordingEnabled = true
+            monitor.start()
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            }
+            monitor.recordingEnabled = false
+            print("log: \(monitor.logFilePath)")
+            if let text = try? String(contentsOfFile: monitor.logFilePath, encoding: .utf8) {
+                let lines = text.split(separator: "\n")
+                print("lines: \(lines.count)")
+                if let last = lines.last { print(String(last)) }
+            }
             exit(0)
         }
 
