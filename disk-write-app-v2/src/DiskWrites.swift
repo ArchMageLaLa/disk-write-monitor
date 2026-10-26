@@ -382,6 +382,13 @@ final class WriteMonitor: ObservableObject {
         recorder.path
     }
 
+    /// 盘级会话写入减去所有可读进程之和：系统进程、短命进程与未归属部分
+    var unattributedBytes: UInt64 {
+        let attributed = procCumulative.values.reduce(UInt64(0), +)
+        let session = UInt64(max(0, sessionGB) * 1e9)
+        return session > attributed ? session - attributed : 0
+    }
+
     func rateHistory(for name: String) -> [WriteSample] {
         (procRates[name] ?? []).map { WriteSample(time: $0.0, rate: $0.1) }
     }
@@ -569,7 +576,7 @@ final class WriteMonitor: ObservableObject {
         device = "/dev/disk0"
         peak = 238.5
         totalGB = 20_137.5
-        sessionGB = 1.12
+        sessionGB = 25.0
         temperature = 30
         rate = 1.4
         errorText = nil
@@ -599,6 +606,7 @@ final class WriteMonitor: ObservableObject {
         }
         history = points
 
+        procCumulative = Dictionary(uniqueKeysWithValues: topProcesses.map { ($0.name, $0.bytes) })
         activeProcesses = ["Google Chrome", "Finder"]
         for (index, name) in ["Google Chrome", "Finder", "backupd"].enumerated() {
             var rates: [(Date, Double)] = []
@@ -756,7 +764,7 @@ struct DashboardView: View {
             .foregroundColor(Palette.muted)
         }
         .padding(22)
-        .frame(width: 600, height: showsUpdateBanner ? 822 : 776, alignment: .topLeading)
+        .frame(width: 600, height: showsUpdateBanner ? 848 : 802, alignment: .topLeading)
         .background(Palette.background)
         .preferredColorScheme(.dark)
     }
@@ -887,6 +895,24 @@ struct DashboardView: View {
                     .frame(height: 162)
                 }
             }
+
+            Rectangle()
+                .fill(Color.white.opacity(0.06))
+                .frame(height: 1)
+                .padding(.top, 2)
+
+            HStack(spacing: 8) {
+                Text("系统与其他")
+                    .font(.system(size: 11.5))
+                    .foregroundColor(Palette.muted)
+                Spacer()
+                Text(formatBytes(monitor.unattributedBytes))
+                    .font(.system(size: 11))
+                    .monospacedDigit()
+                    .foregroundColor(Palette.muted)
+            }
+            .padding(.horizontal, 4)
+            .frame(height: 16)
         }
     }
 

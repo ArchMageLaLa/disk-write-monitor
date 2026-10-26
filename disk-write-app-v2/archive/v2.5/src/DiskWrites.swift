@@ -1,0 +1,1345 @@
+import SwiftUI
+import AppKit
+import Darwin
+import ServiceManagement
+
+// MARK: - 数据模型
+
+struct WriteSample: Identifiable {
+    let id = UUID()
+    let time: Date
+    let rate: Double
+}
+
+struct SmartResult {
+    var units: Int
+    var model: String
+    var temp: Int?
+    var used: Int?
+    var media: Int?
+}
+
+struct ProcWrite: Identifiable {
+    let id: String
+    let name: String
+    let bytes: UInt64
+}
+
+// MARK: - 每天一次的更新检查
+
+@MainActor
+final class UpdateChecker: ObservableObject {
+    struct Release {
+        let version: String
+        let url: URL
+    }
+
+    @Published var available: Release?
+    @Published var dismissedVersion: String?
+
+    private let endpoint = URL(string: "https://api.github.com/repos/ArchMageLaLa/disk-write-monitor/releases/latest")!
+    private let lastCheckKey = "update.lastCheck"
+    private let dismissedKey = "update.dismissedVersion"
+    private var timer: Timer?
+
+    init(previewVersion: String? = nil) {
+        dismissedVersion = UserDefaults.standard.string(forKey: dismissedKey)
+        if let previewVersion,
+           let url = URL(string: "https://github.com/ArchMageLaLa/disk-write-monitor/releases") {
+            available = Release(version: previewVersion, url: url)
+        }
+    }
+
+    func start() {
+        let last = UserDefaults.standard.object(forKey: lastCheckKey) as? Date ?? .distantPast
+        if Date().timeIntervalSince(last) >= 24 * 3600 {
+            check()
+        }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.check() }
+        }
+    }
+
+    func check(completion: ((String?) -> Void)? = nil) {
+        var request = URLRequest(url: endpoint)
+        request.timeoutInterval = 15
+        request.setValue("DiskWriteMonitor/\(UpdateChecker.currentVersion)", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            guard let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = json["tag_name"] as? String,
+                  let urlString = json["html_url"] as? String,
+                  let url = URL(string: urlString) else {
+                DispatchQueue.main.async { completion?(nil) }
+                return
+            }
+
+            let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            Task { @MainActor in
+                self.record(version: version, url: url)
+                completion?(version)
+            }
+        }.resume()
+    }
+
+    func dismiss() {
+        guard let version = available?.version else { return }
+        dismissedVersion = version
+        UserDefaults.standard.set(version, forKey: dismissedKey)
+    }
+
+    private func record(version: String, url: URL) {
+        UserDefaults.standard.set(Date(), forKey: lastCheckKey)
+        if UpdateChecker.isNewer(version, than: UpdateChecker.currentVersion) {
+            available = Release(version: version, url: url)
+        }
+    }
+
+    static var currentVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+
+    nonisolated static func isNewer(_ candidate: String, than current: String) -> Bool {
+        let a = candidate.split(separator: ".").map { Int($0) ?? 0 }
+        let b = current.split(separator: ".").map { Int($0) ?? 0 }
+        for index in 0..<max(a.count, b.count) {
+            let left = index < a.count ? a[index] : 0
+            let right = index < b.count ? b[index] : 0
+            if left != right { return left > right }
+        }
+        return false
+    }
+}
+
+enum Palette {
+    static let background = Color(red: 0.043, green: 0.051, blue: 0.063)
+    static let surface = Color(red: 0.078, green: 0.102, blue: 0.125)
+    static let text = Color(red: 0.914, green: 0.929, blue: 0.949)
+    static let muted = Color(red: 0.541, green: 0.580, blue: 0.651)
+    static let accent = Color(red: 0.220, green: 0.741, blue: 0.973)
+    static let ok = Color(red: 0.204, green: 0.827, blue: 0.600)
+    static let warn = Color(red: 0.984, green: 0.749, blue: 0.141)
+    static let bad = Color(red: 0.973, green: 0.443, blue: 0.443)
+    static let series: [Color] = [
+        Color(red: 0.220, green: 0.741, blue: 0.973),
+        Color(red: 0.353, green: 0.847, blue: 0.588),
+        Color(red: 0.984, green: 0.647, blue: 0.302),
+        Color(red: 0.788, green: 0.580, blue: 0.973),
+        Color(red: 0.973, green: 0.443, blue: 0.545),
+        Color(red: 0.941, green: 0.839, blue: 0.353)
+    ]
+}
+
+// MARK: - 写入记录
+
+final class WriteRecorder {
+    private let directory: URL
+    private let fileURL: URL
+    private let maxBytes: UInt64 = 20 * 1024 * 1024
+    private let formatter: DateFormatter
+
+    init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        directory = base.appendingPathComponent("DiskWriteMonitor", isDirectory: true)
+        fileURL = directory.appendingPathComponent("write-log.jsonl")
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    }
+
+    var path: String { fileURL.path }
+
+    func append(diskMB: Double, window: Double, processes: [(String, Double)], gapMB: Double) {
+        rotateIfNeeded()
+
+        let payload: [String: Any] = [
+            "time": formatter.string(from: Date()),
+            "window_s": number(window),
+            "diskMB": number(diskMB),
+            "gapMB": number(gapMB),
+            "processes": processes.map { ["name": $0.0, "mb": number($0.1)] }
+        ]
+        guard JSONSerialization.isValidJSONObject(payload),
+              var data = try? JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes]) else {
+            return
+        }
+        data.append(0x0A)
+
+        if let handle = try? FileHandle(forWritingTo: fileURL) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: fileURL)
+        }
+    }
+
+    func openFolder() {
+        NSWorkspace.shared.open(directory)
+    }
+
+    private func number(_ value: Double) -> NSDecimalNumber {
+        NSDecimalNumber(string: String(format: "%.2f", value))
+    }
+
+    private func rotateIfNeeded() {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+        guard size > maxBytes else { return }
+
+        let backup = directory.appendingPathComponent("write-log.previous.jsonl")
+        try? FileManager.default.removeItem(at: backup)
+        try? FileManager.default.moveItem(at: fileURL, to: backup)
+    }
+}
+
+// MARK: - 采集器
+
+@MainActor
+final class WriteMonitor: ObservableObject {
+    @Published var rate: Double = 0
+    @Published var peak: Double = 0
+    @Published var totalGB: Double = 0
+    @Published var sessionGB: Double = 0
+    @Published var temperature: Int?
+    @Published var model: String = "正在读取硬盘…"
+    @Published var device: String = "/dev/disk0"
+    @Published var errorText: String?
+    @Published var updated: Date = Date()
+    @Published var history: [WriteSample] = []
+    @Published var isPaused = false
+    @Published var topProcesses: [ProcWrite] = []
+    @Published var activeProcesses: Set<String> = []
+    @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var loginError: String?
+    @Published var recordingEnabled: Bool = UserDefaults.standard.bool(forKey: "recorder.enabled") {
+        didSet { UserDefaults.standard.set(recordingEnabled, forKey: "recorder.enabled") }
+    }
+
+    private var timer: Timer?
+    private var busy = false
+    private var previousUnits: Int?
+    private var previousTime: Date?
+    private var firstUnits: Int?
+    private var consecutiveFailures = 0
+    private var procPreviousBytes: [pid_t: UInt64] = [:]
+    private var procNames: [pid_t: String] = [:]
+    private var procCumulative: [String: UInt64] = [:]
+    private var procRates: [String: [(Date, Double)]] = [:]
+    private var procLastActive: [String: Date] = [:]
+    private var lastProcSample: Date?
+    private let activityThreshold: Double = 256_000
+    private let recorder = WriteRecorder()
+    private var logProcessBytes: [String: UInt64] = [:]
+    private var logDiskBytes: UInt64 = 0
+    private var logWindowStart = Date()
+
+    static let unitBytes = 512_000.0
+
+    func start() {
+        guard timer == nil else { return }
+        tick()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func tick() {
+        guard !isPaused, !busy else { return }
+        busy = true
+        let now = Date()
+        DispatchQueue.global(qos: .utility).async {
+            let outcome = Self.readSmart()
+            let processes = Self.snapshotProcesses()
+            DispatchQueue.main.async { [weak self] in
+                self?.apply(outcome, at: now)
+                self?.applyProcesses(processes, at: now)
+                self?.busy = false
+            }
+        }
+    }
+
+    // MARK: 进程级写入
+
+    private func applyProcesses(_ snapshot: [pid_t: UInt64], at now: Date) {
+        let dt = max(0.2, now.timeIntervalSince(lastProcSample ?? now.addingTimeInterval(-1)))
+        lastProcSample = now
+
+        var deltas: [String: UInt64] = [:]
+        for (pid, written) in snapshot {
+            var name = procNames[pid] ?? Self.processName(pid)
+            if name.hasPrefix("pid ") { name = Self.processName(pid) }
+            procNames[pid] = name
+
+            // 名字还没解析出来时先只记基线，下一轮再累计，
+            // 避免留下永久的 "pid 12345" 条目
+            if name.hasPrefix("pid ") {
+                procPreviousBytes[pid] = written
+                continue
+            }
+
+            if let previous = procPreviousBytes[pid], written >= previous {
+                let delta = written - previous
+                if delta > 0 {
+                    procCumulative[name, default: 0] += delta
+                    deltas[name, default: 0] += delta
+                    logProcessBytes[name, default: 0] += delta
+                }
+            }
+            procPreviousBytes[pid] = written
+        }
+
+        let live = Set(snapshot.keys)
+        for pid in Array(procPreviousBytes.keys) where !live.contains(pid) {
+            procPreviousBytes[pid] = nil
+            procNames[pid] = nil
+        }
+
+        // 进程退出后保留它的累计值；只有极端多条目时才裁剪，防止长时间运行内存膨胀
+        if procCumulative.count > 1200 {
+            let keep = Set(procCumulative.sorted { $0.value > $1.value }.prefix(1000).map { $0.key })
+            for name in Array(procCumulative.keys) where !keep.contains(name) {
+                procCumulative[name] = nil
+                procRates[name] = nil
+                procLastActive[name] = nil
+            }
+        }
+
+        // 每个进程保留最近 60 秒的速率，供叠加曲线使用
+        let cutoff = now.addingTimeInterval(-61)
+        for name in procCumulative.keys {
+            let rate = Double(deltas[name] ?? 0) / dt / 1_000_000.0
+            var points = procRates[name] ?? []
+            points.append((now, rate))
+            if points.count > 90 { points.removeFirst(points.count - 90) }
+            points.removeAll { $0.0 < cutoff }
+            procRates[name] = points
+        }
+
+        for (name, delta) in deltas where Double(delta) >= activityThreshold {
+            procLastActive[name] = now
+        }
+        activeProcesses = Set(
+            procLastActive.compactMap { name, last in
+                now.timeIntervalSince(last) < 2.5 ? name : nil
+            }
+        )
+
+        topProcesses = procCumulative
+            .compactMap { name, total -> ProcWrite? in
+                guard total > 0 else { return nil }
+                return ProcWrite(id: name, name: name, bytes: total)
+            }
+            .sorted { $0.bytes > $1.bytes }
+
+        flushLogIfNeeded(now: now)
+    }
+
+    private func flushLogIfNeeded(now: Date) {
+        guard recordingEnabled else {
+            logProcessBytes.removeAll()
+            logDiskBytes = 0
+            logWindowStart = now
+            return
+        }
+
+        let elapsed = now.timeIntervalSince(logWindowStart)
+        guard elapsed >= 10 else { return }
+
+        let diskMB = Double(logDiskBytes) / 1e6
+        let allProcessMB = Double(logProcessBytes.values.reduce(UInt64(0), +)) / 1e6
+        let top = logProcessBytes
+            .sorted { $0.value > $1.value }
+            .prefix(8)
+            .map { ($0.key, Double($0.value) / 1e6) }
+
+        recorder.append(
+            diskMB: diskMB,
+            window: elapsed,
+            processes: Array(top),
+            gapMB: max(0, diskMB - allProcessMB)
+        )
+
+        logProcessBytes.removeAll()
+        logDiskBytes = 0
+        logWindowStart = now
+    }
+
+    func openLogFolder() {
+        recorder.openFolder()
+    }
+
+    var logFilePath: String {
+        recorder.path
+    }
+
+    func rateHistory(for name: String) -> [WriteSample] {
+        (procRates[name] ?? []).map { WriteSample(time: $0.0, rate: $0.1) }
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+            } else if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            loginError = nil
+        } catch {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            loginError = "设置失败：\(error.localizedDescription)"
+        }
+    }
+
+    nonisolated static func snapshotProcesses() -> [pid_t: UInt64] {
+        var pids = [pid_t](repeating: 0, count: 4096)
+        let bufferSize = Int32(pids.count * MemoryLayout<pid_t>.size)
+        let count = proc_listallpids(&pids, bufferSize)
+        guard count > 0 else { return [:] }
+
+        var result: [pid_t: UInt64] = [:]
+        result.reserveCapacity(Int(count))
+        for index in 0..<Int(count) {
+            let pid = pids[index]
+            guard pid > 0 else { continue }
+            var info = rusage_info_v4()
+            let status = withUnsafeMutablePointer(to: &info) { pointer in
+                pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in
+                    proc_pid_rusage(pid, RUSAGE_INFO_V4, rebound)
+                }
+            }
+            if status == 0, info.ri_diskio_byteswritten > 0 {
+                result[pid] = info.ri_diskio_byteswritten
+            }
+        }
+        return result
+    }
+
+    nonisolated static func processName(_ pid: pid_t) -> String {
+        var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        let length = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+        if length > 0, let path = String(validatingUTF8: pathBuffer) {
+            return (path as NSString).lastPathComponent
+        }
+        var nameBuffer = [CChar](repeating: 0, count: 128)
+        if proc_name(pid, &nameBuffer, UInt32(nameBuffer.count)) > 0,
+           let name = String(validatingUTF8: nameBuffer) {
+            return name
+        }
+        return "pid \(pid)"
+    }
+
+    private func apply(_ outcome: Result<SmartResult, Error>, at now: Date) {
+        switch outcome {
+        case .failure(let error):
+            consecutiveFailures += 1
+            // 硬盘忙时 smartctl 偶尔会读失败，连续失败 3 次才提示
+            if consecutiveFailures >= 3 {
+                errorText = error.localizedDescription
+            }
+            updated = now
+
+        case .success(let result):
+            consecutiveFailures = 0
+            errorText = nil
+            if !result.model.isEmpty { model = result.model }
+            temperature = result.temp
+            if firstUnits == nil { firstUnits = result.units }
+
+            if let prev = previousUnits, let prevTime = previousTime {
+                let delta = max(0, result.units - prev)
+                let dt = max(0.2, now.timeIntervalSince(prevTime))
+                logDiskBytes += UInt64(delta) * UInt64(Self.unitBytes)
+                rate = Double(delta) * Self.unitBytes / 1_000_000.0 / dt
+                peak = max(peak, rate)
+                history.append(WriteSample(time: now, rate: rate))
+            } else {
+                history.append(WriteSample(time: now, rate: 0))
+            }
+
+            previousUnits = result.units
+            previousTime = now
+            totalGB = Double(result.units) * Self.unitBytes / 1e9
+            sessionGB = Double(result.units - (firstUnits ?? result.units)) * Self.unitBytes / 1e9
+            if history.count > 300 { history.removeFirst(history.count - 300) }
+            updated = now
+        }
+    }
+
+    // MARK: smartctl
+
+    nonisolated static func smartctlURL() -> URL? {
+        if let bundled = Bundle.main.url(forResource: "smartctl", withExtension: nil),
+           FileManager.default.isExecutableFile(atPath: bundled.path) {
+            return bundled
+        }
+        for path in ["/usr/local/sbin/smartctl", "/opt/homebrew/sbin/smartctl", "/usr/local/bin/smartctl"] {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return URL(fileURLWithPath: path)
+            }
+        }
+        return nil
+    }
+
+    nonisolated static func readSmart(device: String = "/dev/disk0") -> Result<SmartResult, Error> {
+        guard let tool = smartctlURL() else {
+            return .failure(NSError(domain: "DiskWrites", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "找不到 smartctl，请重新安装本应用。"
+            ]))
+        }
+
+        var lastText = ""
+        var launchError: String?
+
+        // macOS 上 smartctl 偶发 IOCreatePlugInInterfaceForService failed，
+        // 稍等重试即可成功，最多试 3 次。
+        for attempt in 0..<3 {
+            if attempt > 0 { Thread.sleep(forTimeInterval: 0.15) }
+            let task = Process()
+            task.executableURL = tool
+            task.arguments = ["-x", device]
+            let out = Pipe()
+            task.standardOutput = out
+            task.standardError = out
+
+            do {
+                try task.run()
+            } catch {
+                launchError = "无法启动 smartctl：\(error.localizedDescription)"
+                continue
+            }
+
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            let text = String(data: data, encoding: .utf8) ?? ""
+            lastText = text
+
+            if let unitsText = match(#"^\s*Data Units Written:\s+([0-9,]+)"#, in: text),
+               let units = Int(unitsText.replacingOccurrences(of: ",", with: "")) {
+                return .success(SmartResult(
+                    units: units,
+                    model: match(#"^\s*Model Number:\s+(.+?)\s*$"#, in: text) ?? "",
+                    temp: match(#"^\s*Temperature:\s+([0-9]+)"#, in: text).flatMap(Int.init),
+                    used: match(#"^\s*Percentage Used:\s+([0-9]+)"#, in: text).flatMap(Int.init),
+                    media: match(#"^\s*Media and Data Integrity Errors:\s+([0-9]+)"#, in: text).flatMap(Int.init)
+                ))
+            }
+        }
+
+        if ProcessInfo.processInfo.environment["DW_DEBUG"] == "1" {
+            FileHandle.standardError.write(Data(("--- smartctl output ---\n" + lastText + "\n--- end ---\n").utf8))
+        }
+
+        let lines = lastText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "\n")
+            .map(String.init)
+        let snippet = (lines.prefix(1) + lines.suffix(2)).joined(separator: " | ")
+        let message = launchError ?? "读不到这块硬盘的 SMART 数据（\(device)）。\(snippet)"
+        return .failure(NSError(domain: "DiskWrites", code: 3, userInfo: [
+            NSLocalizedDescriptionKey: message
+        ]))
+    }
+
+    nonisolated static func match(_ pattern: String, in text: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let hit = re.firstMatch(in: text, options: [], range: range),
+              hit.numberOfRanges > 1,
+              let captured = Range(hit.range(at: 1), in: text) else { return nil }
+        return String(text[captured])
+    }
+
+    func seedPreview() {
+        model = "APPLE SSD AP0512Z"
+        device = "/dev/disk0"
+        peak = 238.5
+        totalGB = 20_137.5
+        sessionGB = 1.12
+        temperature = 30
+        rate = 1.4
+        errorText = nil
+        topProcesses = [
+            ProcWrite(id: "Google Chrome", name: "Google Chrome", bytes: 12_400_000_000),
+            ProcWrite(id: "Finder", name: "Finder", bytes: 3_100_000_000),
+            ProcWrite(id: "backupd", name: "backupd", bytes: 1_500_000_000),
+            ProcWrite(id: "Xcode", name: "Xcode", bytes: 900_000_000),
+            ProcWrite(id: "WeChat", name: "WeChat", bytes: 240_000_000),
+            ProcWrite(id: "Photos", name: "Photos", bytes: 120_000_000),
+            ProcWrite(id: "mds", name: "mds", bytes: 64_000_000),
+            ProcWrite(id: "Spotlight", name: "Spotlight", bytes: 32_000_000),
+            ProcWrite(id: "Terminal", name: "Terminal", bytes: 18_000_000),
+            ProcWrite(id: "Mail", name: "Mail", bytes: 7_000_000)
+        ]
+        let now = Date()
+        var points: [WriteSample] = []
+        for i in stride(from: 59, through: 0, by: -1) {
+            let x = Double(59 - i)
+            var v = 0.4 + sin(x / 3.0) * 0.25
+            if (8...10).contains(Int(x)) { v = 210 - Double(Int(x) - 8) * 12 }
+            if (15...17).contains(Int(x)) { v = 195 - Double(Int(x) - 15) * 10 }
+            if (22...24).contains(Int(x)) { v = 205 - Double(Int(x) - 22) * 9 }
+            if (41...43).contains(Int(x)) { v = 168 - Double(Int(x) - 41) * 20 }
+            if (46...48).contains(Int(x)) { v = 238 - Double(Int(x) - 46) * 6 }
+            points.append(WriteSample(time: now.addingTimeInterval(-Double(i)), rate: max(0, v)))
+        }
+        history = points
+
+        activeProcesses = ["Google Chrome", "Finder"]
+        for (index, name) in ["Google Chrome", "Finder", "backupd"].enumerated() {
+            var rates: [(Date, Double)] = []
+            for step in stride(from: 59, through: 0, by: -1) {
+                let t = 59 - step
+                var value = 0.3 + sin((Double(t) + Double(index) * 14) / 7) * 0.2
+                let start = 22 + index * 8
+                if t >= start && t <= start + 4 {
+                    value = 6 + Double(index) * 3 - Double(t - start)
+                }
+                rates.append((now.addingTimeInterval(-Double(step)), max(0, value)))
+            }
+            procRates[name] = rates
+        }
+    }
+}
+
+// MARK: - 界面
+
+struct DashboardView: View {
+    var isPreview: Bool = false
+    var previewSelection: [String] = []
+    @EnvironmentObject var monitor: WriteMonitor
+    @EnvironmentObject var updater: UpdateChecker
+    @State private var selected: [String]
+
+    private let maxSelection = 6
+
+    init(isPreview: Bool = false, previewSelection: [String] = []) {
+        self.isPreview = isPreview
+        self.previewSelection = previewSelection
+        _selected = State(initialValue: previewSelection)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+                .padding(.bottom, 22)
+
+            if let release = updater.available, updater.dismissedVersion != release.version {
+                updateBanner(release)
+                    .padding(.bottom, 12)
+            }
+
+            Text("当前写入速度")
+                .font(.system(size: 13))
+                .foregroundColor(Palette.muted)
+                .padding(.bottom, 8)
+
+            HStack(alignment: .firstTextBaseline, spacing: 9) {
+                Text(formatRate(monitor.rate))
+                    .font(.system(size: 66, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [Color.white, Color(red: 0.60, green: 0.85, blue: 0.96)],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+                Text("MB / 秒")
+                    .font(.system(size: 16))
+                    .foregroundColor(Palette.muted)
+            }
+            .padding(.bottom, 6)
+
+            if let error = monitor.errorText {
+                Text(error)
+                    .font(.system(size: 12))
+                    .foregroundColor(Palette.bad)
+                    .lineLimit(2)
+                    .padding(.vertical, 6)
+            }
+
+            HStack(spacing: 8) {
+                Text(selected.isEmpty ? "整盘写入 · 60 秒" : "已选 \(selected.count) 个进程 · 60 秒")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Palette.text)
+                if selected.count >= maxSelection {
+                    Text("最多 \(maxSelection) 个")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(Palette.muted)
+                }
+                Spacer()
+                if !selected.isEmpty {
+                    Button("清除") { selected.removeAll() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundColor(Palette.muted)
+                }
+            }
+            .padding(.top, 2)
+            .padding(.bottom, 2)
+
+            ChartView(series: chartSeries)
+                .frame(height: 186)
+                .padding(.top, 2)
+                .padding(.bottom, 2)
+
+            HStack {
+                Text("60 秒前").font(.system(size: 11)).foregroundColor(Palette.muted)
+                Spacer()
+                Text("现在").font(.system(size: 11)).foregroundColor(Palette.muted)
+            }
+            .padding(.bottom, 18)
+
+            HStack(spacing: 10) {
+                statTile("本次会话写入", monitor.sessionGB >= 1000
+                         ? String(format: "%.2f", monitor.sessionGB / 1000) : String(format: "%.2f", monitor.sessionGB),
+                         monitor.sessionGB >= 1000 ? "TB" : "GB")
+                statTile("累计写入", monitor.totalGB >= 1000
+                         ? String(format: "%.2f", monitor.totalGB / 1000) : String(format: "%.1f", monitor.totalGB),
+                         monitor.totalGB >= 1000 ? "TB" : "GB")
+                statTile("本次峰值", formatRate(monitor.peak), "MB/s")
+                statTile("硬盘温度", monitor.temperature.map(String.init) ?? "–", "°C")
+            }
+            .padding(.bottom, 14)
+
+            processSection
+                .padding(.bottom, 12)
+
+            HStack(spacing: 14) {
+                settingToggle("开机自启", isOn: monitor.launchAtLogin) {
+                    monitor.setLaunchAtLogin(!monitor.launchAtLogin)
+                }
+
+                settingToggle("记录写入日志", isOn: monitor.recordingEnabled) {
+                    monitor.recordingEnabled.toggle()
+                }
+
+                if monitor.recordingEnabled {
+                    Button("打开日志") {
+                        monitor.openLogFolder()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundColor(Palette.accent)
+                }
+
+                if let error = monitor.loginError {
+                    Text(error)
+                        .font(.system(size: 10.5))
+                        .foregroundColor(Palette.bad)
+                        .lineLimit(1)
+                }
+                Spacer()
+            }
+            .padding(.bottom, 10)
+
+            HStack {
+                Text("数据来源：smartctl + proc_pid_rusage")
+                Spacer()
+                Text("更新于 \(timeString(monitor.updated))")
+            }
+            .font(.system(size: 11))
+            .foregroundColor(Palette.muted)
+        }
+        .padding(22)
+        .frame(width: 600, height: showsUpdateBanner ? 822 : 776, alignment: .topLeading)
+        .background(Palette.background)
+        .preferredColorScheme(.dark)
+    }
+
+    private var showsUpdateBanner: Bool {
+        guard let release = updater.available else { return false }
+        return updater.dismissedVersion != release.version
+    }
+
+    private func settingToggle(_ title: String, isOn: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(Palette.muted)
+                ZStack(alignment: isOn ? .trailing : .leading) {
+                    Capsule()
+                        .fill(isOn ? Palette.ok.opacity(0.85) : Color.white.opacity(0.12))
+                        .frame(width: 30, height: 17)
+                    Circle()
+                        .fill(Color.white.opacity(0.92))
+                        .frame(width: 13, height: 13)
+                        .padding(2)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func updateBanner(_ release: UpdateChecker.Release) -> some View {
+        HStack(spacing: 10) {
+            Text("↑")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(Palette.accent)
+            Text("发现新版本 v\(release.version)")
+                .font(.system(size: 12))
+                .foregroundColor(Palette.text)
+            Button("查看") {
+                NSWorkspace.shared.open(release.url)
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundColor(Palette.accent)
+            Spacer()
+            Button {
+                updater.dismiss()
+            } label: {
+                Text("✕")
+                    .font(.system(size: 11))
+                    .foregroundColor(Palette.muted)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Palette.accent.opacity(0.12))
+        )
+    }
+
+    private var chartSeries: [ChartSeries] {
+        if selected.isEmpty {
+            return [ChartSeries(id: "disk", name: "整盘", color: Palette.accent, points: monitor.history)]
+        }
+        return selected.enumerated().map { index, name in
+            ChartSeries(
+                id: name,
+                name: name,
+                color: seriesColor(index),
+                points: monitor.rateHistory(for: name)
+            )
+        }
+    }
+
+    private func seriesColor(_ index: Int) -> Color {
+        Palette.series[index % Palette.series.count]
+    }
+
+    private func toggleSelection(_ name: String) {
+        if let index = selected.firstIndex(of: name) {
+            selected.remove(at: index)
+        } else if selected.count < maxSelection {
+            selected.append(name)
+        }
+    }
+
+    private var processSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("本次会话 · 谁在写")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Palette.text)
+                Spacer()
+                Text(monitor.topProcesses.isEmpty
+                     ? "累计写入量"
+                     : "累计写入量 · \(monitor.topProcesses.count) 个")
+                    .font(.system(size: 11))
+                    .foregroundColor(Palette.muted)
+            }
+
+            if monitor.topProcesses.isEmpty {
+                Text(monitor.errorText == nil ? "还没有采集到明显的进程写入" : "暂时读不到进程数据")
+                    .font(.system(size: 11.5))
+                    .foregroundColor(Palette.muted)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 8)
+            } else {
+                let maxBytes = monitor.topProcesses.first?.bytes ?? 1
+                if isPreview {
+                    // ImageRenderer 无法渲染 ScrollView 内容，截图时用静态列表
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(monitor.topProcesses.prefix(7))) { item in
+                            processRow(item, maxBytes: maxBytes)
+                        }
+                    }
+                    .frame(height: 162, alignment: .top)
+                    .clipped()
+                } else {
+                    ScrollView(.vertical, showsIndicators: true) {
+                        LazyVStack(alignment: .leading, spacing: 6) {
+                            ForEach(monitor.topProcesses) { item in
+                                processRow(item, maxBytes: maxBytes)
+                            }
+                        }
+                        .padding(.trailing, 2)
+                    }
+                    .frame(height: 162)
+                }
+            }
+        }
+    }
+
+    private func processRow(_ item: ProcWrite, maxBytes: UInt64) -> some View {
+        let fraction = maxBytes == 0 ? 0 : Double(item.bytes) / Double(maxBytes)
+        let selectionIndex = selected.firstIndex(of: item.name)
+        let color = selectionIndex.map { seriesColor($0) } ?? Palette.accent
+        let isActive = monitor.activeProcesses.contains(item.name)
+
+        return Button {
+            toggleSelection(item.name)
+        } label: {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(isActive ? Palette.ok : Color.white.opacity(0.12))
+                    .frame(width: 7, height: 7)
+
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(selectionIndex == nil ? Color.clear : color)
+                    .frame(width: 3, height: 13)
+
+                Text(item.name)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(Palette.text)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: 126, alignment: .leading)
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.06))
+                        Capsule()
+                            .fill(color.opacity(selectionIndex == nil ? 0.78 : 0.90))
+                            .frame(width: max(3, geo.size.width * CGFloat(fraction)))
+                    }
+                }
+                .frame(height: 6)
+
+                Text(formatBytes(item.bytes))
+                    .font(.system(size: 11))
+                    .monospacedDigit()
+                    .foregroundColor(Palette.muted)
+                    .frame(width: 72, alignment: .trailing)
+            }
+            .padding(.horizontal, 4)
+            .frame(height: 18)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(selectionIndex == nil ? Color.clear : color.opacity(0.10))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func formatBytes(_ bytes: UInt64) -> String {
+        let value = Double(bytes)
+        if value >= 1e9 {
+            return String(format: "%.1f GB", value / 1e9)
+        }
+        if value >= 1e7 {
+            return String(format: "%.0f MB", value / 1e6)
+        }
+        if value >= 1e6 {
+            return String(format: "%.1f MB", value / 1e6)
+        }
+        return String(format: "%.0f KB", value / 1e3)
+    }
+
+    private var header: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(monitor.model)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(Palette.text)
+                    .lineLimit(1)
+                Text("\(monitor.device) · 1 秒采样")
+                    .font(.system(size: 12))
+                    .foregroundColor(Palette.muted)
+            }
+            Spacer()
+            HStack(spacing: 10) {
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(monitor.isPaused ? Palette.warn : (monitor.errorText == nil ? Palette.ok : Palette.bad))
+                        .frame(width: 7, height: 7)
+                    Text(monitor.isPaused ? "已暂停" : (monitor.errorText == nil ? "实时" : "读取失败"))
+                        .font(.system(size: 12))
+                        .foregroundColor(Palette.muted)
+                }
+                .padding(.horizontal, 11)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(Color.white.opacity(0.05)))
+
+                Button(monitor.isPaused ? "继续" : "暂停") {
+                    monitor.isPaused.toggle()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(Palette.muted)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+            }
+        }
+    }
+
+    private func statTile(_ title: String, _ value: String, _ unit: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 11.5))
+                .foregroundColor(Palette.muted)
+                .lineLimit(1)
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text(value)
+                    .font(.system(size: 20, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundColor(Palette.text)
+                Text(unit)
+                    .font(.system(size: 11))
+                    .foregroundColor(Palette.muted)
+            }
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Palette.surface))
+    }
+
+    private func formatRate(_ value: Double) -> String {
+        value < 0.05 ? "0.0" : String(format: "%.1f", value)
+    }
+
+    private func timeString(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f.string(from: date)
+    }
+}
+
+struct ChartSeries: Identifiable {
+    let id: String
+    let name: String
+    let color: Color
+    let points: [WriteSample]
+}
+
+struct ChartView: View {
+    let series: [ChartSeries]
+
+    var body: some View {
+        Canvas { context, size in
+            let left: CGFloat = 44
+            let right = size.width - 8
+            let top: CGFloat = 10
+            let bottom = size.height - 16
+            let now = Date()
+            let window: TimeInterval = 60
+            let start = now.addingTimeInterval(-window)
+
+            let cutoff = start.addingTimeInterval(-2)
+            let visibleSeries = series
+                .map { ($0, $0.points.filter { $0.time >= cutoff }) }
+                .filter { !$0.1.isEmpty }
+
+            var maxRate: Double = 1
+            for (_, points) in visibleSeries {
+                for p in points { maxRate = max(maxRate, p.rate) }
+            }
+            let maxY = niceMax(maxRate * 1.15)
+
+            // 网格与刻度
+            for i in 0...4 {
+                let y = bottom - (bottom - top) * CGFloat(i) / 4
+                var line = Path()
+                line.move(to: CGPoint(x: left, y: y))
+                line.addLine(to: CGPoint(x: right, y: y))
+                context.stroke(line, with: .color(Color.white.opacity(0.07)), lineWidth: 1)
+
+                let value = maxY * Double(i) / 4
+                let label = value >= 10 ? String(format: "%.0f", value) : String(format: "%.1f", value)
+                context.draw(
+                    Text(label)
+                        .font(.system(size: 10))
+                        .foregroundColor(Palette.muted),
+                    at: CGPoint(x: left - 8, y: y),
+                    anchor: .trailing
+                )
+            }
+
+            guard visibleSeries.contains(where: { $0.1.count >= 2 }) else {
+                context.draw(
+                    Text("收集中…").font(.system(size: 11)).foregroundColor(Palette.muted),
+                    at: CGPoint(x: (left + right) / 2, y: (top + bottom) / 2)
+                )
+                return
+            }
+
+            func xPos(_ time: Date) -> CGFloat {
+                let ratio = time.timeIntervalSince(start) / window
+                return left + CGFloat(max(0, min(1, ratio))) * (right - left)
+            }
+            func yPos(_ value: Double) -> CGFloat {
+                let ratio = min(value, maxY) / maxY
+                return bottom - CGFloat(ratio) * (bottom - top)
+            }
+
+            // 只有一条曲线时填充面积，多条时只画线，避免互相遮挡
+            if visibleSeries.count == 1, let only = visibleSeries.first {
+                let points = only.1
+                var area = Path()
+                area.move(to: CGPoint(x: xPos(points[0].time), y: bottom))
+                for p in points {
+                    area.addLine(to: CGPoint(x: xPos(p.time), y: yPos(p.rate)))
+                }
+                area.addLine(to: CGPoint(x: xPos(points[points.count - 1].time), y: bottom))
+                area.closeSubpath()
+                context.fill(
+                    area,
+                    with: .linearGradient(
+                        Gradient(colors: [only.0.color.opacity(0.28), only.0.color.opacity(0.0)]),
+                        startPoint: CGPoint(x: 0, y: top),
+                        endPoint: CGPoint(x: 0, y: bottom)
+                    )
+                )
+            }
+
+            for (item, points) in visibleSeries {
+                var line = Path()
+                for (index, p) in points.enumerated() {
+                    let point = CGPoint(x: xPos(p.time), y: yPos(p.rate))
+                    if index == 0 { line.move(to: point) } else { line.addLine(to: point) }
+                }
+                context.stroke(
+                    line,
+                    with: .color(item.color),
+                    style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round)
+                )
+
+                if let last = points.last {
+                    let point = CGPoint(x: xPos(last.time), y: yPos(last.rate))
+                    context.fill(
+                        Path(ellipseIn: CGRect(x: point.x - 6, y: point.y - 6, width: 12, height: 12)),
+                        with: .color(item.color.opacity(0.18))
+                    )
+                    context.fill(
+                        Path(ellipseIn: CGRect(x: point.x - 2.5, y: point.y - 2.5, width: 5, height: 5)),
+                        with: .color(item.color)
+                    )
+                }
+            }
+        }
+    }
+
+    private func niceMax(_ value: Double) -> Double {
+        if value <= 0.6 { return 1 }
+        let exponent = floor(log10(value))
+        let base = pow(10.0, exponent)
+        for multiplier in [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0] where value <= multiplier * base {
+            return multiplier * base
+        }
+        return 10 * base
+    }
+}
+
+// MARK: - 应用入口
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let args = CommandLine.arguments
+
+        if args.contains("--selftest") {
+            let result = WriteMonitor.readSmart()
+            switch result {
+            case .success(let r):
+                let tool = WriteMonitor.smartctlURL()?.path ?? "none"
+                print("selftest ok: model=\(r.model) units=\(r.units) temp=\(r.temp.map(String.init) ?? "-")")
+                print("smartctl=\(tool)")
+            case .failure(let e):
+                print("selftest failed: \(e.localizedDescription)")
+            }
+
+            let first = WriteMonitor.snapshotProcesses()
+            Thread.sleep(forTimeInterval: 1.2)
+            let second = WriteMonitor.snapshotProcesses()
+            var deltas: [(String, UInt64)] = []
+            for (pid, bytes) in second {
+                if let prev = first[pid], bytes > prev {
+                    deltas.append((WriteMonitor.processName(pid), bytes - prev))
+                }
+            }
+            deltas.sort { $0.1 > $1.1 }
+            print("proc: \(second.count) pids sampled, \(deltas.count) active")
+            for (name, bytes) in deltas.prefix(5) {
+                print(String(format: "  %-24@ %8.2f MB", name as NSString, Double(bytes) / 1e6))
+            }
+            exit(0)
+        }
+
+        if let index = args.firstIndex(of: "--render"), index + 1 < args.count {
+            renderPreview(to: args[index + 1])
+            exit(0)
+        }
+
+        if let index = args.firstIndex(of: "--proctest") {
+            let seconds = index + 1 < args.count ? (Double(args[index + 1]) ?? 6) : 6
+            let monitor = WriteMonitor()
+            monitor.start()
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            }
+            print("proctest top:")
+            for item in monitor.topProcesses {
+                print(String(format: "  %-24@ %8.2f MB", item.name as NSString, Double(item.bytes) / 1e6))
+            }
+            print(String(format: "disk rate: %.2f MB/s, total %.1f GB, err: %@",
+                         monitor.rate, monitor.totalGB, (monitor.errorText ?? "none") as NSString))
+            exit(0)
+        }
+
+        if let index = args.firstIndex(of: "--login"), index + 1 < args.count {
+            let monitor = WriteMonitor()
+            monitor.setLaunchAtLogin(args[index + 1] == "on")
+            print("login status: \(SMAppService.mainApp.status.rawValue) error=\(monitor.loginError ?? "none")")
+            exit(0)
+        }
+
+        if args.contains("--check-update") {
+            let checker = UpdateChecker()
+            var finished = false
+            checker.check { tag in
+                let newer = tag.map { UpdateChecker.isNewer($0, than: UpdateChecker.currentVersion) } ?? false
+                print("current=\(UpdateChecker.currentVersion) latest=\(tag ?? "nil") newer=\(newer)")
+                finished = true
+            }
+            let deadline = Date().addingTimeInterval(20)
+            while !finished && Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            }
+            UserDefaults.standard.removeObject(forKey: "update.lastCheck")
+            exit(0)
+        }
+
+        if let index = args.firstIndex(of: "--logtest") {
+            let seconds = index + 1 < args.count ? (Double(args[index + 1]) ?? 15) : 15
+            let monitor = WriteMonitor()
+            monitor.recordingEnabled = true
+            monitor.start()
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            }
+            monitor.recordingEnabled = false
+            print("log: \(monitor.logFilePath)")
+            if let text = try? String(contentsOfFile: monitor.logFilePath, encoding: .utf8) {
+                let lines = text.split(separator: "\n")
+                print("lines: \(lines.count)")
+                if let last = lines.last { print(String(last)) }
+            }
+            exit(0)
+        }
+
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            sender.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
+        }
+        return true
+    }
+
+    @MainActor
+    private func renderPreview(to path: String) {
+        let monitor = WriteMonitor()
+        monitor.seedPreview()
+
+        writePreview(
+            DashboardView(isPreview: true),
+            monitor: monitor,
+            to: path
+        )
+        let selectedPath = path.replacingOccurrences(of: ".png", with: "-selected.png")
+        writePreview(
+            DashboardView(isPreview: true, previewSelection: ["Google Chrome", "Finder"]),
+            monitor: monitor,
+            to: selectedPath
+        )
+        let updatePath = path.replacingOccurrences(of: ".png", with: "-update.png")
+        writePreview(
+            DashboardView(isPreview: true, previewSelection: ["Google Chrome", "Finder"]),
+            monitor: monitor,
+            checker: UpdateChecker(previewVersion: "2.5"),
+            to: updatePath
+        )
+    }
+
+    @MainActor
+    private func writePreview<V: View>(
+        _ content: V,
+        monitor: WriteMonitor,
+        checker: UpdateChecker? = nil,
+        to path: String
+    ) {
+        let checker = checker ?? UpdateChecker()
+        let view = content
+            .environmentObject(monitor)
+            .environmentObject(checker)
+            .environment(\.colorScheme, .dark)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        guard let image = renderer.cgImage else {
+            print("render failed")
+            return
+        }
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard let data = rep.representation(using: .png, properties: [:]) else {
+            print("png encode failed")
+            return
+        }
+        do {
+            try data.write(to: URL(fileURLWithPath: path))
+            print("rendered \(path)")
+        } catch {
+            print("write failed: \(error)")
+        }
+    }
+}
+
+@main
+struct DiskWritesApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    @StateObject private var monitor = WriteMonitor()
+    @StateObject private var updater = UpdateChecker()
+
+    var body: some Scene {
+        WindowGroup("磁盘写入量") {
+            DashboardView()
+                .environmentObject(monitor)
+                .environmentObject(updater)
+                .onAppear {
+                    monitor.start()
+                    updater.start()
+                }
+        }
+        .windowResizability(.contentSize)
+        .commands {
+            CommandGroup(replacing: .newItem) {}
+        }
+    }
+}
